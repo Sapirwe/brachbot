@@ -1,93 +1,199 @@
-import openai
+
+import json
+import re
+import asyncio
+
+# --- OpenAI (modern client) ---
+try:
+    from openai import OpenAI
+    _USING_RESPONSES_API = True
+except Exception:
+    # Fallback to legacy interface if needed
+    import openai  # type: ignore
+    _USING_RESPONSES_API = False
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import tokens
-import re
 
-# Initialize OpenAI API with your GPT-3.5 API key
-openai.api_key = tokens.API_gpt_token
+import tokens  # expects: tokens.API_gpt_token, tokens.telegram_bot_token
 
+
+# =====================
+# Config
+# =====================
+MODEL = "gpt-4o-mini"  # fast + inexpensive; upgrade as you wish
+
+# JSON Schema for Structured Outputs
+BRACHABOT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_food": {"type": "boolean"},
+        "category": {
+            "type": "string",
+            "enum": ["לחם", "מזונות", "פרי_עץ", "פרי_אדמה", "שהכל", "לא_מאכל", "לא_ידוע"],
+        },
+        "bracha": {
+            "type": "string",
+            "description": "הברכה הראשונה המתאימה או '—' אם לא מאכל/לא ידוע",
+        },
+        "explanation": {"type": "string"},
+        "notes": {"type": "string"},
+    },
+    "required": ["is_food", "category", "bracha", "explanation"],
+    "additionalProperties": False,
+}
+
+# Deterministic mapping (server-side safety)
+CATEGORY_TO_BRACHA = {
+    "לחם": "המוציא לחם מן הארץ",
+    "מזונות": "בורא מיני מזונות",
+    "פרי_עץ": "בורא פרי העץ",
+    "פרי_אדמה": "בורא פרי האדמה",
+    "שהכל": "שהכל נהיה בדברו",
+}
+
+
+SYSTEM_PROMPT = """
+אתה מומחה בהלכה יהודית בענייני ברכות. מטרתך: לקבוע ברכה ראשונה מדויקת לפי כללים הלכתיים נפוצים.
+אם הקלט אינו מאכל – עליך לציין זאת במפורש. החזר JSON תקין בלבד לפי הסכימה שסופקה.
+
+כללים תמציתיים:
+- לחם ודומיו (פת): "המוציא".
+- דגנים שאינם לחם (פת הבאה בכסנין, עוגות/עוגיות/בורקס, דייסות, קוסקוס/פסטה/איטריות/בורגול/אורז מבושלים): "מזונות".
+- פרי עץ אמיתי: "בורא פרי העץ".
+- גידולי קרקע שאינם עץ (לרבות בננה): "בורא פרי האדמה".
+- בשר/דגים/ביצים/גבינות/משקאות/ממתקים/מאכלים מעובדים/תערובות ללא רכיב דגן עיקרי: "שהכל".
+- מנה מורכבת: המרכיב העיקרי קובע.
+- אם זה לא מאכל: is_food=false, category="לא_מאכל", bracha="—".
+- אם חסר מידע או קיימת מחלוקת משמעותית: category="לא_ידוע" עם הסבר קצר.
+
+דוגמאות קצרות (לא תיאור מלא):
+- "תפוח" → פרי_עץ/בורא פרי העץ.
+- "בננה" → פרי_אדמה/בורא פרי האדמה.
+- "קרואסון" (רגיל, לא קביעת סעודה) → מזונות/בורא מיני מזונות.
+- "שניצל" → שהכל/שהכל נהיה בדברו.
+
+החזר אך ורק JSON — ללא טקסט נוסף.
+""".strip()
+
+
+# =====================
+# OpenAI helpers
+# =====================
+def _coerce_bracha(category: str, bracha_from_model: str) -> str:
+    """Prefer deterministic mapping; return '—' for non-food/unknown."""
+    category = (category or "").strip()
+    bracha_from_model = (bracha_from_model or "").strip()
+    if category in ("לא_מאכל", "לא_ידוע"):
+        return "—"
+    mapped = CATEGORY_TO_BRACHA.get(category)
+    if mapped:
+        return mapped
+    # Last resort: model's suggestion or default
+    return bracha_from_model or "שהכל נהיה בדברו"
+
+
+def _legacy_chat_completion(food_name: str, details: str = "") -> dict:
+    """Legacy fallback using ChatCompletion with JSON instruction."""
+    import openai  # legacy
+    openai.api_key = tokens.API_gpt_token
+    user_prompt = f'שם המאכל: "{food_name}"\\nתיאור (אופציונלי): {details or "—"}'
+    json_only = (
+        "החזר JSON תקין בלבד לפי הסכימה: "
+        + json.dumps(BRACHABOT_SCHEMA, ensure_ascii=False)
+    )
+
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT + "\\n\\n" + json_only},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0,
+    )
+    text = resp["choices"][0]["message"]["content"]
+    return json.loads(text)
+
+
+def ask_openai(food_name: str, details: str = "") -> dict:
+    """
+    Calls OpenAI with Structured Outputs if available; else uses legacy fallback.
+    Returns a dict that matches BRACHABOT_SCHEMA.
+    """
+    if not _USING_RESPONSES_API:
+        return _legacy_chat_completion(food_name, details)
+
+    client = OpenAI(api_key=tokens.API_gpt_token)
+    user_prompt = f'שם המאכל: "{food_name}"\\nתיאור (אופציונלי): {details or "—"}'
+
+    resp = client.responses.create(
+        model=MODEL,
+        input=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "brachabot", "schema": BRACHABOT_SCHEMA},
+        },
+    )
+    # Try to extract the JSON payload robustly
+    try:
+        text = resp.output[0].content[0].text  # standard path
+    except Exception:
+        # Fallback: some SDKs expose .output_text or similar
+        text = getattr(resp, "output_text", None) or getattr(resp, "content", None)
+        if text is None:
+            # Last resort: convert to str and try to find JSON in it
+            raw = str(resp)
+            m = re.search(r"\\{.*\\}", raw, flags=re.S)
+            text = m.group(0) if m else "{}"
+
+    return json.loads(text)
+
+
+# =====================
+# Telegram Handlers
+# =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("שלום! שלח לי שם של מאכל או מנה ואני אחזיר לך את הברכה המתאימה. אני יכול לטפל במנות מורכבות כמו 'סלט קינואה עם חזה עוף' או מאכלים פשוטים")
+    await update.message.reply_text(
+        "שלום! שלח/י שם של מאכל או מנה (גם מורכבת) ואחזיר את הברכה המתאימה.\n"
+        "דוגמה: 'סלט קינואה עם חזה עוף', 'תפוח', 'קרואסון'."
+    )
+
 
 async def get_bracha(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    food_name = update.message.text.strip()
-    
-    # Smart prompt that lets GPT do all the thinking
-    prompt = f"""
-    אתה מומחה בהלכה יהודית. המשתמש שואל על הברכה הנכונה לפני אכילת: "{food_name}"
-
-    כללי הברכות (בסדר חשיבות):
-    
-    **חשוב מאוד - ברכה ראשונה:**
-    - "המוציא לחם מן הארץ" - לכל סוגי הלחם והמאפים (לחם, פיתות, לחמניה, בייגל, מצה, פיתה, לאפה וכו')
-    
-    **אם זה לא לחם, השתמש באחת מהברכות הבאות:**
-    - "בורא פרי העץ" - לפירות עצים (תפוח, תפוז, בננה וכו')
-    - "בורא פרי האדמה" - לירקות מהאדמה (גזר, תפוח אדמה, עגבניה וכו')
-    - "שהכל נהיה בדברו" - למזונות מעובדים (בשר, דגים, ביצים, אומלט, חביתה וכו')
-    - "בורא מיני מזונות" - למוצרי דגן שאינם לחם (אורז, פסטה, קינואה, קרואסון, עוגה, עוגיות וכו')
-
-    עבור מנות מורכבות, זהה את המרכיב העיקרי והשתמש בברכה המתאימה.
-
-    אם "{food_name}" הוא לא מאכל (כמו בעלי חיים, חפצים, אנשים וכו') - תשיב: "{food_name} זה לא מאכל"
-
-    תשובה בעברית בלבד:
-    """
+    food_name = (update.message.text or "").strip()
+    if not food_name:
+        await update.message.reply_text("שלח/י שם מאכל אחד 😄")
+        return
 
     try:
-        # Let GPT do all the work
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0.1  # Very low temperature for consistent responses
-        )
-        
-        # Get GPT's response
-        gpt_response = response['choices'][0]['message']['content'].strip()
-        
-        # Check if GPT says it's not a food
-        if "זה לא מאכל" in gpt_response:
-            await update.message.reply_text(gpt_response)
+        data = ask_openai(food_name)
+        is_food = bool(data.get("is_food"))
+        category = str(data.get("category", "לא_ידוע"))
+        bracha_model = str(data.get("bracha", ""))
+        final_bracha = _coerce_bracha(category, bracha_model)
+
+        if not is_food or category == "לא_מאכל" or final_bracha == "—":
+            await update.message.reply_text(f"{food_name} זה לא מאכל")
             return
-        
-        # Extract just the blessing from GPT response
-        blessing_patterns = [
-            r'המוציא לחם מן הארץ',
-            r'בורא פרי העץ',
-            r'בורא פרי האדמה', 
-            r'שהכל נהיה בדברו',
-            r'בורא מיני מזונות'
-        ]
-        
-        final_blessing = None
-        for pattern in blessing_patterns:
-            match = re.search(pattern, gpt_response)
-            if match:
-                final_blessing = match.group(0)
-                break
-        
-        # If GPT didn't give a valid blessing, use default
-        if final_blessing is None:
-            final_blessing = "שהכל נהיה בדברו"
-        
-        # Send ONLY the blessing
-        await update.message.reply_text(final_blessing)
-        
+
+        # Send ONLY the blessing text (as you requested)
+        await update.message.reply_text(final_bracha)
+
     except Exception as e:
-        # Simple fallback if API fails
+        # Fallback if something goes wrong
         await update.message.reply_text("שהכל נהיה בדברו")
 
+
 def main():
-    # Initialize the Telegram bot
     app = ApplicationBuilder().token(tokens.telegram_bot_token).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_bracha))
-    
-    # Run the bot
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
